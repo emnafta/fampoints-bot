@@ -1,0 +1,13 @@
+{
+  "name": "fampoints-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "grammy": "^1.36.0",
+    "better-sqlite3": "^11.10.0"
+  }
+}
