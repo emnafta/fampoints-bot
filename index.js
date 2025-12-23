@@ -2,11 +2,11 @@ import { Bot } from "grammy";
 import Database from "better-sqlite3";
 
 /**
- * FamPoints Bot (v1)
+ * FamPoints Bot (v1.1)
  * Features:
  * - Messages count
- * - Karma: reply "+" awards 1 point to the author of replied-to message
- * - FIRST karma ever (per user per group) announces with Toronto slang
+ * - FamPoints: reply with certain triggers awards 1 point to the author of replied-to message
+ * - First ever FamPoint (per user per group) announces with Toronto slang + @username
  * - Invites: /myinvite creates personal native Telegram invite links
  * - Invite confirmation: counts invite only after user stays 24h AND sends >=3 messages
  * - /me, /leaderboard
@@ -29,6 +29,61 @@ const FIRST_POINT_MESSAGES = [
   "{name} just unlocked their first FamPoint. We see you.",
   "That ting? Yeah {name}, that’s a FamPoint. First one, we love to see it."
 ];
+
+// Reaction replies that count as a FamPoint (must be a reply)
+const FAMPOINT_TRIGGERS = new Set([
+  "+",
+  "<3",
+  "❤️",
+  "♥️",
+  "nice",
+  "agreed",
+  "thanks",
+  "thank you",
+  "thx",
+  "ty",
+  "good one",
+  "well said",
+  "facts",
+  "based",
+  "w",
+  "big w",
+  "gg",
+  "🔥",
+  "👏",
+  "💯",
+  "✅",
+  "🙏",
+  "👍",
+  "🫡"
+]);
+
+// Prevent long “essays” from being used to farm points
+const MAX_TRIGGER_MESSAGE_LENGTH = 40;
+
+// Normalize text so "Thanks!!" and "thanks" behave the same
+function normalizeTriggerText(s) {
+  return (s || "")
+    .trim()
+    .toLowerCase()
+    // remove common trailing punctuation
+    .replace(/[!.?,;:]+$/g, "")
+    // collapse spaces
+    .replace(/\s+/g, " ");
+}
+
+function isFamPointTrigger(rawText) {
+  const t = normalizeTriggerText(rawText);
+
+  // exact match triggers
+  if (FAMPOINT_TRIGGERS.has(t)) return true;
+
+  // Allow "+ anything" as a special case (optional)
+  // Comment out if you want STRICT triggers only
+  if (t.startsWith("+")) return true;
+
+  return false;
+}
 
 // --- DB schema ---
 db.exec(`
@@ -80,22 +135,18 @@ const now = () => Math.floor(Date.now() / 1000);
 function upsertUser(chatId, u) {
   if (!u?.id) return;
 
-  db.prepare(
-    `
+  db.prepare(`
     INSERT INTO users (chat_id, user_id, username, first_name)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(chat_id, user_id) DO UPDATE SET
       username=excluded.username,
       first_name=excluded.first_name
-  `
-  ).run(chatId, u.id, u.username || null, u.first_name || null);
+  `).run(chatId, u.id, u.username || null, u.first_name || null);
 
-  db.prepare(
-    `
+  db.prepare(`
     INSERT INTO stats (chat_id, user_id) VALUES (?, ?)
     ON CONFLICT(chat_id, user_id) DO NOTHING
-  `
-  ).run(chatId, u.id);
+  `).run(chatId, u.id);
 }
 
 function displayName(row) {
@@ -109,38 +160,31 @@ bot.command("me", async (ctx) => {
   const u = ctx.from;
   upsertUser(chatId, u);
 
-  const s =
-    db
-      .prepare(
-        `
+  const s = db.prepare(`
     SELECT messages, karma, karma_given, invites_pending, invites_confirmed
     FROM stats WHERE chat_id=? AND user_id=?
-  `
-      )
-      .get(chatId, u.id) || {
-      messages: 0,
-      karma: 0,
-      karma_given: 0,
-      invites_pending: 0,
-      invites_confirmed: 0
-    };
+  `).get(chatId, u.id) || {
+    messages: 0,
+    karma: 0,
+    karma_given: 0,
+    invites_pending: 0,
+    invites_confirmed: 0,
+  };
 
   await ctx.reply(
     `👤 ${u.first_name}${u.username ? ` (@${u.username})` : ""}\n` +
-      `➕ FamPoints: ${s.karma}\n` +
-      `💬 Messages: ${s.messages}\n` +
-      `🤝 Given: ${s.karma_given}\n` +
-      `🎟️ Invites: ${s.invites_confirmed} confirmed (${s.invites_pending} pending)\n` +
-      `🆔 ID: ${u.id}`
+    `➕ FamPoints: ${s.karma}\n` +
+    `💬 Messages: ${s.messages}\n` +
+    `🤝 Given: ${s.karma_given}\n` +
+    `🎟️ Invites: ${s.invites_confirmed} confirmed (${s.invites_pending} pending)\n` +
+    `🆔 ID: ${u.id}`
   );
 });
 
 bot.command("leaderboard", async (ctx) => {
   const chatId = ctx.chat.id;
 
-  const top = db
-    .prepare(
-      `
+  const top = db.prepare(`
     SELECT u.user_id, u.first_name, u.username,
            s.karma, s.messages, s.invites_confirmed
     FROM stats s
@@ -148,9 +192,7 @@ bot.command("leaderboard", async (ctx) => {
     WHERE s.chat_id=?
     ORDER BY s.karma DESC, s.invites_confirmed DESC, s.messages DESC
     LIMIT 10
-  `
-    )
-    .all(chatId);
+  `).all(chatId);
 
   if (!top.length) return ctx.reply("No FamPoints yet.");
 
@@ -167,13 +209,9 @@ bot.command("myinvite", async (ctx) => {
   const u = ctx.from;
   upsertUser(chatId, u);
 
-  const existing = db
-    .prepare(
-      `
+  const existing = db.prepare(`
     SELECT invite_link FROM invite_links WHERE chat_id=? AND inviter_id=?
-  `
-    )
-    .get(chatId, u.id);
+  `).get(chatId, u.id);
 
   if (existing?.invite_link) {
     return ctx.reply(`Here’s your invite link:\n${existing.invite_link}`);
@@ -181,15 +219,13 @@ bot.command("myinvite", async (ctx) => {
 
   // Requires bot admin permission: Manage Invite Links
   const link = await ctx.api.createChatInviteLink(chatId, {
-    name: `invited by ${u.username ? "@" + u.username : u.first_name}`
+    name: `invited by ${u.username ? "@"+u.username : u.first_name}`,
   });
 
-  db.prepare(
-    `
+  db.prepare(`
     INSERT INTO invite_links (chat_id, inviter_id, invite_link)
     VALUES (?, ?, ?)
-  `
-  ).run(chatId, u.id, link.invite_link);
+  `).run(chatId, u.id, link.invite_link);
 
   await ctx.reply(`Here’s your invite link:\n${link.invite_link}`);
 });
@@ -208,38 +244,28 @@ bot.on("message", async (ctx) => {
 
       let inviterId = null;
       if (inviteLink) {
-        const inviter = db
-          .prepare(
-            `
+        const inviter = db.prepare(`
           SELECT inviter_id FROM invite_links WHERE chat_id=? AND invite_link=?
-        `
-          )
-          .get(chatId, inviteLink);
+        `).get(chatId, inviteLink);
         if (inviter?.inviter_id) inviterId = inviter.inviter_id;
       }
 
-      db.prepare(
-        `
+      db.prepare(`
         INSERT INTO invite_joins (chat_id, joined_user_id, inviter_id, joined_at, confirmed)
         VALUES (?, ?, ?, ?, 0)
         ON CONFLICT(chat_id, joined_user_id) DO NOTHING
-      `
-      ).run(chatId, joinUser.id, inviterId, now());
+      `).run(chatId, joinUser.id, inviterId, now());
 
       if (inviterId) {
-        db.prepare(
-          `
+        db.prepare(`
           INSERT INTO stats (chat_id, user_id) VALUES (?, ?)
           ON CONFLICT(chat_id, user_id) DO NOTHING
-        `
-        ).run(chatId, inviterId);
+        `).run(chatId, inviterId);
 
-        db.prepare(
-          `
+        db.prepare(`
           UPDATE stats SET invites_pending = invites_pending + 1
           WHERE chat_id=? AND user_id=?
-        `
-        ).run(chatId, inviterId);
+        `).run(chatId, inviterId);
       }
     }
     return;
@@ -250,20 +276,24 @@ bot.on("message", async (ctx) => {
   if (!u?.id) return;
   upsertUser(chatId, u);
 
-  const text = (ctx.message.text || "").trim();
+  const rawText = ctx.message.text || "";
+  const text = rawText.trim();
 
   // Count messages (ignore commands)
   if (ctx.message.text && !text.startsWith("/")) {
-    db.prepare(
-      `
+    db.prepare(`
       UPDATE stats SET messages = messages + 1
       WHERE chat_id=? AND user_id=?
-    `
-    ).run(chatId, u.id);
+    `).run(chatId, u.id);
   }
 
-  // Karma: reply "+" awards author of replied-to message
-  if (ctx.message.text && text === "+" && ctx.message.reply_to_message?.from) {
+  // FamPoints: reply with trigger awards author of replied-to message
+  if (
+    ctx.message.text &&
+    ctx.message.reply_to_message?.from &&
+    isFamPointTrigger(rawText) &&
+    text.length <= MAX_TRIGGER_MESSAGE_LENGTH
+  ) {
     const target = ctx.message.reply_to_message.from;
     if (!target?.id) return;
 
@@ -271,60 +301,44 @@ bot.on("message", async (ctx) => {
     if (target.id === u.id) return;
 
     // Cooldown per giver
-    const cd = db
-      .prepare(
-        `
+    const cd = db.prepare(`
       SELECT last_at FROM karma_cooldowns WHERE chat_id=? AND giver_id=?
-    `
-      )
-      .get(chatId, u.id);
+    `).get(chatId, u.id);
 
     const t = now();
-    if (cd && t - cd.last_at < KARMA_COOLDOWN_SECONDS) return;
+    if (cd && (t - cd.last_at) < KARMA_COOLDOWN_SECONDS) return;
 
-    db.prepare(
-      `
+    db.prepare(`
       INSERT INTO karma_cooldowns (chat_id, giver_id, last_at)
       VALUES (?, ?, ?)
       ON CONFLICT(chat_id, giver_id) DO UPDATE SET last_at=excluded.last_at
-    `
-    ).run(chatId, u.id, t);
+    `).run(chatId, u.id, t);
 
     upsertUser(chatId, target);
 
     // Check if this is their first FamPoint (karma == 0 before increment)
-    const before = db
-      .prepare(
-        `
+    const before = db.prepare(`
       SELECT karma FROM stats WHERE chat_id=? AND user_id=?
-    `
-      )
-      .get(chatId, target.id);
+    `).get(chatId, target.id);
 
     const wasZero = (before?.karma ?? 0) === 0;
 
     // Increment karma
-    db.prepare(
-      `
+    db.prepare(`
       UPDATE stats SET karma = karma + 1
       WHERE chat_id=? AND user_id=?
-    `
-    ).run(chatId, target.id);
+    `).run(chatId, target.id);
 
     // Track karma given
-    db.prepare(
-      `
+    db.prepare(`
       UPDATE stats SET karma_given = karma_given + 1
       WHERE chat_id=? AND user_id=?
-    `
-    ).run(chatId, u.id);
+    `).run(chatId, u.id);
 
     // Announce ONLY the first FamPoint
     if (wasZero) {
       const template =
-        FIRST_POINT_MESSAGES[
-          Math.floor(Math.random() * FIRST_POINT_MESSAGES.length)
-        ];
+        FIRST_POINT_MESSAGES[Math.floor(Math.random() * FIRST_POINT_MESSAGES.length)];
 
       const name = target.username ? `@${target.username}` : target.first_name;
       const message = template.replace("{name}", name);
@@ -332,51 +346,38 @@ bot.on("message", async (ctx) => {
       await ctx.reply(message);
     }
 
-    // Optional: delete "+" spam if you give bot delete perms
-    // await ctx.api.deleteMessage(chatId, ctx.message.message_id).catch(()=>{});
+    // Optional: delete the trigger message if bot has permission
+    // await ctx.api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
   }
 
   // Lightweight invite confirmation checks (do a few per message)
-  const candidates = db
-    .prepare(
-      `
+  const candidates = db.prepare(`
     SELECT joined_user_id, inviter_id, joined_at
     FROM invite_joins
     WHERE chat_id=? AND confirmed=0 AND inviter_id IS NOT NULL
     LIMIT 5
-  `
-    )
-    .all(chatId);
+  `).all(chatId);
 
   for (const c of candidates) {
-    if (now() - c.joined_at < INVITE_CONFIRM_AFTER_SECONDS) continue;
+    if ((now() - c.joined_at) < INVITE_CONFIRM_AFTER_SECONDS) continue;
 
-    const msgCount =
-      db
-        .prepare(
-          `
+    const msgCount = db.prepare(`
       SELECT messages FROM stats WHERE chat_id=? AND user_id=?
-    `
-        )
-        .get(chatId, c.joined_user_id)?.messages || 0;
+    `).get(chatId, c.joined_user_id)?.messages || 0;
 
     if (msgCount < INVITE_CONFIRM_MIN_MESSAGES) continue;
 
-    db.prepare(
-      `
+    db.prepare(`
       UPDATE invite_joins SET confirmed=1
       WHERE chat_id=? AND joined_user_id=?
-    `
-    ).run(chatId, c.joined_user_id);
+    `).run(chatId, c.joined_user_id);
 
-    db.prepare(
-      `
+    db.prepare(`
       UPDATE stats
       SET invites_pending = CASE WHEN invites_pending > 0 THEN invites_pending - 1 ELSE 0 END,
           invites_confirmed = invites_confirmed + 1
       WHERE chat_id=? AND user_id=?
-    `
-    ).run(chatId, c.inviter_id);
+    `).run(chatId, c.inviter_id);
   }
 });
 
